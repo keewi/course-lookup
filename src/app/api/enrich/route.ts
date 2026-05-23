@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
+import { rateLimit } from "@/lib/rate-limit";
+import { getCached, setCache } from "@/lib/cache";
 
 export const runtime = "nodejs";
 
@@ -12,8 +14,32 @@ function getClient() {
 }
 
 export async function POST(req: NextRequest) {
+  const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
+  const { allowed, remaining } = rateLimit(ip);
+
+  if (!allowed) {
+    return NextResponse.json(
+      { error: "Too many requests. Please wait a minute before searching again." },
+      {
+        status: 429,
+        headers: { "Retry-After": "60", "X-RateLimit-Remaining": "0" },
+      }
+    );
+  }
+
   const { school, department, courseNumber, title, description, instructors } =
     await req.json();
+
+  const cacheKey = `${school}:${department}:${courseNumber}`.toLowerCase();
+  const cached = getCached(cacheKey);
+  if (cached) {
+    return NextResponse.json(cached, {
+      headers: {
+        "X-RateLimit-Remaining": String(remaining),
+        "X-Cache": "HIT",
+      },
+    });
+  }
 
   const schoolName = school === "sfu" ? "Simon Fraser University" : "Stanford University";
 
@@ -90,7 +116,14 @@ Return ONLY valid JSON, no markdown fences.`;
       message.content[0].type === "text" ? message.content[0].text : "";
     const data = JSON.parse(text);
 
-    return NextResponse.json(data);
+    setCache(cacheKey, data);
+
+    return NextResponse.json(data, {
+      headers: {
+        "X-RateLimit-Remaining": String(remaining),
+        "X-Cache": "MISS",
+      },
+    });
   } catch (e) {
     console.error("Enrich error:", e);
     return NextResponse.json(
